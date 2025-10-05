@@ -1,11 +1,14 @@
-This a python project that stores daily tick data of nse index derivatives which include nifty, banknifty, finnifty, micapnifty. The tick data is collected from kotak neo api interface.
-To use this python code, you must need:
+This a python project that stores daily tick data of nse index derivatives which includes nifty, banknifty, finnifty, micapnifty. The tick data is collected using kotak neo api.
+To use this python code, you need:
 a)Kotak neo accout
-b)Kotak neo trade api access(which will give you consumer oken and secret key for connecting to their api service)
+b)Kotak neo trade api access(which will give you consumer token and secret key for connecting to their api service)
+
+
+
 
 Working:
 The code first logs you in. Then it fetches which expiry is today?
-It then collects tick data in list format. 
+It then collects tick data and stores it in list format. 
 Then it empties the list in multiple cycles into a csv file.
 this emptying of data in multiple cycles is carried out from the start of the market at 9:15 till the close of market till 3:30.
 When markets close, the program automatically shuts itself and the process is over.
