@@ -1,3 +1,8 @@
+# Kotak Neo Options Tick Data Collector
+# collects real time tick data for nse index options on expiry days
+# stores per second data as csv and converts to 5 min OHLC after market close
+# pip install neo_api_client pandas python-dateutil nsepython python-dotenv
+
 from neo_api_client import NeoAPI
 import pandas as pd
 import time
@@ -5,722 +10,429 @@ from time import sleep
 from datetime import datetime
 import datetime as dt
 from dateutil.relativedelta import relativedelta
-import threading
-from threading import Thread
 import os
 import sys
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-
-consumer_key1='YOUR KOTAK CONSUMER KEY' 
-consumer_secret1='YOUR KOTAK CONSUMER SECRET KEY'
-mob_no='+91 REGISTERED MOBILE NUMBER'
-password1='KOTAK LOGIN PASSWORD'
-mpin='KOTAK LOGIN MPIN'
+import csv
+from dotenv import load_dotenv
+from nsepython import nse_optionchain_scrapper
 
 
+# loading credentials from .env file (keep your secrets safe!)
+load_dotenv()
 
-print("Starting Login")
-live_data={}
+consumer_key1 = os.environ.get('KOTAK_CONSUMER_KEY', '')
+consumer_secret1 = os.environ.get('KOTAK_CONSUMER_SECRET', '')
+mob_no = os.environ.get('KOTAK_MOBILE_NUMBER', '')
+password1 = os.environ.get('KOTAK_LOGIN_PASSWORD', '')
+mpin = os.environ.get('KOTAK_LOGIN_MPIN', '')
+base_output_dir = os.environ.get('BASE_OUTPUT_DIR', '')
 
-def on_message(message):
-    global live_data
-    try:
-        print(f"Message is: {message}")
-        for i in message:
-            live_data[i['ts']]=i['ltp']
-    except Exception as e:
-        print(f"Error is: {e}")
-    
-def on_error(error_message):
-    print(error_message)
-
-client = NeoAPI(consumer_key=consumer_key1, consumer_secret=consumer_secret1, 
-                environment='prod', on_message=on_message, on_error=on_error, on_close=None, on_open=None)
-
-# Initiate login by passing any of the combinations mobilenumber & password (or) pan & password (or) userid & password
-
-client.login(mobilenumber=mob_no, password=password1)
-
-# Complete login and generate session token
-client.session_2fa(OTP=mpin)
-print("Finished Login\nLogged In Successfully!")
-trading_instru= instrument_dict['NIFTY']
-inst_tokens = [{"instrument_token": trading_instru, "exchange_segment": "nse_cm"}]
-temp_price=client.quotes(instrument_tokens=inst_tokens, quote_type="ltp")
-print(temp_price)
-
-
+# check if all credentials are filled in
+if not all([consumer_key1, consumer_secret1, mob_no, password1, mpin, base_output_dir]):
+    print("ERROR: Some credentials are missing! Please fill in your .env file")
+    sys.exit(1)
 
 
 '''
-Instrument tokens/pSymbol for Index of NSE and BSE
+Instrument tokens/pSymbol for Index of NSE
 
 BANKNIFTY='26009'
 NIFTY='26000'
 FINNIFTY='26037'
 MIDCPNIFTY='26074'
-SENSEX='1'
-BANKEX='12'
-
 '''
-instrument_dict={'BANKNIFTY':'26009' , 'NIFTY':'26000' , 'FINNIFTY':'26037' , 'MIDCPNIFTY':'26074' , 'SENSEX':'1'}
-strike_diff_dict={'nifty_strike_difference': 50,'banknifty_strike_difference': 100,'finnifty_strike_difference': 50,'midcapnifty_strike_difference': 25}
+instrument_dict = {'BANKNIFTY': '26009', 'NIFTY': '26000', 'FINNIFTY': '26037', 'MIDCPNIFTY': '26074'}
+strike_diff_dict = {
+    'nifty_strike_difference': 50,
+    'banknifty_strike_difference': 100,
+    'finnifty_strike_difference': 50,
+    'midcapnifty_strike_difference': 25
+}
+
+# how many strikes above and below ATM to track
+num_strikes = 10
+
+# how often to dump data to csv (in minutes)
+dump_interval = 3
 
 
+# ======================== LOGIN ========================
+
+print("Starting Login")
+live_data = {}
+
+def on_message(message):
+    global live_data
+    try:
+        for i in message:
+            live_data[i['ts']] = i['ltp']
+    except Exception as e:
+        print(f"Error in message: {e}")
+
+def on_error(error_message):
+    print(f"Error: {error_message}")
+
+client = NeoAPI(consumer_key=consumer_key1, consumer_secret=consumer_secret1,
+                environment='prod', on_message=on_message, on_error=on_error, on_close=None, on_open=None)
+
+client.login(mobilenumber=mob_no, password=password1)
+client.session_2fa(OTP=mpin)
+print("Finished Login\nLogged In Successfully!")
 
 
+# ======================== SCRIP MASTER ========================
 
+print("Downloading scrip master...")
 scrp_nfo = client.scrip_master(exchange_segment="NFO")
 df = pd.read_csv(scrp_nfo)
+print(f"Scrip master loaded - {len(df)} rows")
 
 
-#scrp_bfo= client.scrip_master(exchange_segment = "BFO")
-#df2=pd.read_csv(scrp_bfo)
+# ======================== FILTER EXPIRY DATA ========================
 
-date_for_folder = datetime.now().strftime('%Y-%m-%d')
-base_directory=''
 print("Starting expiry filteration")
-def filter_data(df,index1):
-    df=df[df['pInstType']=='OPTIDX']
-    df=df[df['pSymbolName']==index1]
-    df['lExpiryDate ']=df['lExpiryDate '].apply(lambda x: dt.datetime.fromtimestamp(x).date()+relativedelta(years=10))
-    exp=df['lExpiryDate '].to_list()
-    td=dt.date.today()
-    cur_exp=min(exp, key= lambda x: (x - td))
-    df=df[df['lExpiryDate ']==cur_exp]
-    df['dStrikePrice;']=df['dStrikePrice;'].apply(lambda x: int(str(x)[:5]))
-    df=df[['pTrdSymbol','pSymbol','pOptionType','dStrikePrice;','lExpiryDate ']]
-    df=df.reset_index(drop=True)
+
+def filter_data(df, index1):
+    # filter only option index instruments for the given index
+    df = df[df['pInstType'] == 'OPTIDX']
+    df = df[df['pSymbolName'] == index1]
+
+    # kotak dates need +10 years offset (weird but thats how it works)
+    df['lExpiryDate '] = df['lExpiryDate '].apply(
+        lambda x: dt.datetime.fromtimestamp(x).date() + relativedelta(years=10)
+    )
+
+    # find the nearest expiry date
+    exp = df['lExpiryDate '].to_list()
+    td = dt.date.today()
+    future_exp = [d for d in exp if d >= td]
+    if not future_exp:
+        print(f"No future expiry found for {index1}!")
+        return pd.DataFrame()
+    cur_exp = min(future_exp)
+    df = df[df['lExpiryDate '] == cur_exp]
+
+    # clean strike price
+    df['dStrikePrice;'] = df['dStrikePrice;'].apply(lambda x: int(str(x)[:5]))
+    df = df[['pTrdSymbol', 'pSymbol', 'pOptionType', 'dStrikePrice;', 'lExpiryDate ']]
+    df = df.reset_index(drop=True)
     return df
 
-'''
-def filter_data2(df2,index1):
-    df2=df2[df2['pInstType']=='OPTIDX']
-    df2=df2[df2['pSymbolName']==index1]
-    df2['lExpiryDate ']=df2['lExpiryDate '].apply(lambda x: dt.datetime.fromtimestamp(x).date()+relativedelta(years=10))
-    exp=df2['lExpiryDate '].to_list()
-    td=dt.date.today()
-    cur_exp=min(exp, key= lambda x: (x - td))
-    df2=df2[df2['lExpiryDate ']==cur_exp]
-    df2['dStrikePrice;']=df2['dStrikePrice;'].apply(lambda x: int(str(x)[:5]))
-    df2=df2[['pTrdSymbol','pSymbol','pOptionType','dStrikePrice;','lExpiryDate ']]
-    df2=df2.reset_index(drop=True)
-    return df2
-'''
+
+data_Nifty = filter_data(df, 'NIFTY')
+data_Banknifty = filter_data(df, 'BANKNIFTY')
+data_Finnifty = filter_data(df, 'FINNIFTY')
+data_Midcapnifty = filter_data(df, 'MIDCPNIFTY')
+print("Finished expiry filteration")
 
 
-data_Nifty=filter_data(df,'NIFTY')
-data_Banknifty=filter_data(df,'BANKNIFTY')
-data_Finnifty=filter_data(df,'FINNIFTY')
-data_Midcapnifty=filter_data(df,'MIDCPNIFTY')
-#data_Sensex=filter_data2(df2,'BSXOPT') (BSE DATES ARE UNREADABLE AND GIBBERISH AND NOT ACCURATE)
+# ======================== FETCH EXPIRY DATES FROM NSE ========================
+# using nsepython to get live expiry dates from NSE website
+# (earlier we used selenium + niftytrader.in but that website stopped working)
+
+print("Fetching expiry dates from NSE...")
+
+nse_symbol_map = {
+    'NIFTY': 'NIFTY',
+    'BANKNIFTY': 'BANKNIFTY',
+    'FINNIFTY': 'FINNIFTY',
+    'MIDCPNIFTY': 'MIDCPNIFTY'
+}
+
+expiry_dates_dict = {}
+for index_name, nse_symbol in nse_symbol_map.items():
+    try:
+        data = nse_optionchain_scrapper(nse_symbol)
+        dates = data.get('records', {}).get('expiryDates', [])
+        expiry_dates_dict[index_name] = dates
+        print(f"Expiry dates for {index_name}: {dates[:3]}")
+    except Exception as e:
+        print(f"Failed to fetch expiry for {index_name}: {e}")
+        expiry_dates_dict[index_name] = []
 
 
-#check which index is having expiry today?
-today_date = str(dt.date.today())
-'''
-nifty_exp_date = data_Nifty['lExpiryDate '].unique()
-banknifty_exp_date = data_Banknifty['lExpiryDate '].unique()
-finnifty_exp_date = data_Finnifty['lExpiryDate '].unique()
-midcapnifty_exp_date = data_Midcapnifty['lExpiryDate '].unique()
-'''
+# ======================== CHECK WHICH INDEX HAS EXPIRY TODAY ========================
 
-def fetch_and_print_expiry_dates():
-    # Define the function to fetch expiry dates
-    def fetch_expiry_dates(index_symbol):
-        # Initialize Chrome WebDriver
-        service = Service('/path to chromedriver/chromedriver')  # Set the path to chromedriver executable
-        driver = webdriver.Chrome(service=service)
-
-        try:
-            url = f"https://www.niftytrader.in/nse-option-chain/{index_symbol}"
-            driver.get(url)
-
-            # Wait for the select element to be present
-            WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, 'select.form-select')))
-            
-            # Find the select element containing expiry dates
-            expiry_select = driver.find_element(By.CSS_SELECTOR, 'select.form-select')
-            expiry_dates = [option.text for option in expiry_select.find_elements(By.TAG_NAME, 'option')]
-
-            return expiry_dates
-
-        except Exception as e:
-            print(f"Error fetching data for {index_symbol.upper()}: {e}")
-            return None
-
-        finally:
-            time.sleep(3)
-            driver.quit()
-
-    indices = ["nifty", "banknifty", "finnifty", "midcpnifty"]
-    global expiry_dates_dict# Dictionary to store expiry dates for each index
-    expiry_dates_dict = {}
-
-    # Fetch expiry dates for each index
-    for index_symbol in indices:
-        expiry_dates = fetch_expiry_dates(index_symbol)
-        expiry_dates_dict[index_symbol] = expiry_dates
-    
-    # Printing expiry dates for each index
-    for index_symbol, expiry_dates in expiry_dates_dict.items():
-        print(f"Expiry dates for {index_symbol.upper()}:")
-        if expiry_dates:
-            for date in expiry_dates:
-                print(date)
-        else:
-            print(f"Failed to fetch expiry dates for {index_symbol.upper()}.")
-
-def run_in_thread():
-    thread = threading.Thread(target=fetch_and_print_expiry_dates)
-    thread.start()
-    thread.join()
-    
-run_in_thread()
-
-
-expiry_lists=[]
-for x,y in expiry_dates_dict.items():
-    a1=y[0].split('/')[::-1]
-    expiry_lists.append('-'.join(a1))
-
-print(expiry_lists)
-
-
-
-
-trading_instru=''
-index1= None
-d= None
 print("Starting expiry finder")
-if expiry_lists[0]==today_date:
-    trading_instru= instrument_dict['NIFTY']
-    index1=strike_diff_dict['nifty_strike_difference']
-    d= data_Nifty
-    base_directory = '/directory to store data/Options_Data/Nifty'
-elif expiry_lists[1]==today_date:
-    trading_instru= instrument_dict['BANKNIFTY']
-    index1=strike_diff_dict['banknifty_strike_difference']
-    d= data_Banknifty
-    base_directory = '/directory to store data/Options_Data/Banknifty'
-elif expiry_lists[2]==today_date:
-    trading_instru= instrument_dict['FINNIFTY']
-    index1=strike_diff_dict['finnifty_strike_difference']
-    d= data_Finnifty
-    base_directory = '/directory to store data/Options_Data/Finnifty'
-elif expiry_lists[3]==today_date:
-    trading_instru= instrument_dict['MIDCPNIFTY']
-    index1=strike_diff_dict['midcapnifty_strike_difference']
-    d= data_Midcapnifty
-    base_directory = '/directory to store data/Options_Data/Midcpnifty'
+today_date = str(dt.date.today())
 
-trading_instru= instrument_dict['NIFTY']
-index1=strike_diff_dict['nifty_strike_difference']
-d= data_Nifty
-base_directory = '/directory to store data/Options_Data/Nifty'
-    
+trading_instru = ''
+index1 = None
+d = None
+date_for_folder = datetime.now().strftime('%Y-%m-%d')
+base_directory = ''
+
+# check each index - is its nearest expiry today?
+for index_name, dates in expiry_dates_dict.items():
+    if not dates:
+        continue
+    try:
+        # NSE gives dates like "31-Oct-2026"
+        nearest_exp = datetime.strptime(dates[0].strip(), "%d-%b-%Y").date()
+        if str(nearest_exp) == today_date:
+            if index_name == 'NIFTY':
+                trading_instru = instrument_dict['NIFTY']
+                index1 = strike_diff_dict['nifty_strike_difference']
+                d = data_Nifty
+                base_directory = os.path.join(base_output_dir, 'Nifty')
+            elif index_name == 'BANKNIFTY':
+                trading_instru = instrument_dict['BANKNIFTY']
+                index1 = strike_diff_dict['banknifty_strike_difference']
+                d = data_Banknifty
+                base_directory = os.path.join(base_output_dir, 'Banknifty')
+            elif index_name == 'FINNIFTY':
+                trading_instru = instrument_dict['FINNIFTY']
+                index1 = strike_diff_dict['finnifty_strike_difference']
+                d = data_Finnifty
+                base_directory = os.path.join(base_output_dir, 'Finnifty')
+            elif index_name == 'MIDCPNIFTY':
+                trading_instru = instrument_dict['MIDCPNIFTY']
+                index1 = strike_diff_dict['midcapnifty_strike_difference']
+                d = data_Midcapnifty
+                base_directory = os.path.join(base_output_dir, 'Midcpnifty')
+            print(f"Today's expiry: {index_name}")
+            break
+    except Exception as e:
+        print(f"Could not parse date for {index_name}: {e}")
+
+# if no expiry found today, default to nifty (for testing/demo)
+if not trading_instru:
+    print("No expiry today - defaulting to NIFTY")
+    trading_instru = instrument_dict['NIFTY']
+    index1 = strike_diff_dict['nifty_strike_difference']
+    d = data_Nifty
+    base_directory = os.path.join(base_output_dir, 'Nifty')
 
 print("Finished expiry finder")
 
 
-'''
-for demo nifty work:uncomment this
-trading_instru= instrument_dict['NIFTY']
-index1=strike_diff_dict['nifty_strike_difference']
-d= data_Nifty
-base_directory = '\directory to store data\Options_Data\Nifty'
-'''
-
-
-
+# ======================== GET ATM STRIKE PRICE ========================
 
 print("Starting tokenization")
 inst_tokens = [{"instrument_token": trading_instru, "exchange_segment": "nse_cm"}]
-temp_price=client.quotes(instrument_tokens=inst_tokens, quote_type="ltp")
-print("finished tokenization")
-atm_price=float(temp_price['message'][0]['ltp'])
-filtered_atm_strike_price=int(index1*round(atm_price/index1))
-print("atm filtered")
+temp_price = client.quotes(instrument_tokens=inst_tokens, quote_type="ltp")
+print(f"Spot price data: {temp_price}")
 
-#getting tokens of strike price 4 places up and down OTM
-ce_option_buy_strike_price4= str(filtered_atm_strike_price+(index1*4))+'CE'
-pe_option_buy_strike_price4= str(filtered_atm_strike_price-(index1*4))+'PE'
-
-ce_option_buy_strike_price3= str(filtered_atm_strike_price+(index1*3))+'CE'
-pe_option_buy_strike_price3= str(filtered_atm_strike_price-(index1*3))+'PE'
-
-ce_option_buy_strike_price2= str(filtered_atm_strike_price+(index1*2))+'CE'
-pe_option_buy_strike_price2= str(filtered_atm_strike_price-(index1*2))+'PE'
-
-ce_option_buy_strike_price1= str(filtered_atm_strike_price+(index1*1))+'CE'
-pe_option_buy_strike_price1= str(filtered_atm_strike_price-(index1*1))+'PE'
-
-ce_option_buy_atm_price= str(filtered_atm_strike_price)+'CE'
-pe_option_buy_atm_price= str(filtered_atm_strike_price)+'PE'
-
-#ITM NOW:
-
-pe_option_buy_strike_price_1= str(filtered_atm_strike_price+(index1*1))+'PE'
-ce_option_buy_strike_price_1= str(filtered_atm_strike_price-(index1*1))+'CE'
+atm_price = float(temp_price['message'][0]['ltp'])
+filtered_atm_strike_price = int(index1 * round(atm_price / index1))
+print(f"ATM strike: {filtered_atm_strike_price}")
+print("Finished tokenization")
 
 
-pe_option_buy_strike_price_2= str(filtered_atm_strike_price+(index1*2))+'PE'
-ce_option_buy_strike_price_2= str(filtered_atm_strike_price-(index1*2))+'CE'
+# ======================== BUILD OPTION CHAIN ========================
+# getting tokens for strikes above and below ATM
+# num_strikes up and down for both CE and PE
+
+print(f"Building option chain - {num_strikes} strikes each side of ATM")
+
+option_chain = []  # list to store all the option legs we want to track
+
+for offset in range(-num_strikes, num_strikes + 1):
+    strike = filtered_atm_strike_price + (offset * index1)
+
+    for opt_type in ['CE', 'PE']:
+        # search in the filtered scrip data for this strike and option type
+        match = d[(d['dStrikePrice;'] == strike) & (d['pOptionType'] == opt_type)]
+
+        if match.empty:
+            print(f"Warning: no scrip found for {strike}{opt_type} - skipping")
+            continue
+
+        row = match.iloc[0]
+        option_chain.append({
+            'strike': strike,
+            'option_type': opt_type,
+            'offset': offset,
+            'instrument_token': str(row['pSymbol']),
+            'trading_symbol': row['pTrdSymbol']
+        })
+
+print(f"Option chain built - {len(option_chain)} legs total")
 
 
-pe_option_buy_strike_price_3= str(filtered_atm_strike_price+(index1*3))+'PE'
-ce_option_buy_strike_price_3= str(filtered_atm_strike_price-(index1*3))+'CE'
+# ======================== FOLDER CREATION ========================
 
-pe_option_buy_strike_price_4= str(filtered_atm_strike_price+(index1*4))+'PE'
-ce_option_buy_strike_price_4= str(filtered_atm_strike_price-(index1*4))+'CE'
+new_folder_path = os.path.join(base_directory, date_for_folder)
+os.makedirs(new_folder_path, exist_ok=True)
 
-print("token generation step1")
-
-
-ce4_temp_token= None
-pe4_temp_token= None
-ce3_temp_token= None
-pe3_temp_token= None
-ce2_temp_token= None
-pe2_temp_token= None
-ce1_temp_token= None
-pe1_temp_token= None
-ce_atm_temp_token= None
-pe_atm_temp_token= None
-ce_4_temp_token= None
-pe_4_temp_token= None
-ce_3_temp_token= None
-pe_3_temp_token= None
-ce_2_temp_token= None
-pe_2_temp_token= None
-ce_1_temp_token= None
-pe_1_temp_token= None
-
-
-ce4_final_token= None
-pe4_final_token= None
-ce3_final_token= None
-pe3_final_token= None
-ce2_final_token= None
-pe2_final_token= None
-ce1_final_token= None
-pe1_final_token= None
-ce_atm_final_token= None
-pe_atm_final_token= None
-ce_4_final_token= None
-pe_4_final_token= None
-ce_3_final_token= None
-pe_3_final_token= None
-ce_2_final_token= None
-pe_2_final_token= None
-ce_1_final_token= None
-pe_1_final_token= None
-
-
-for x,y in d['pTrdSymbol'].items():
-    a=y[:-8:-1]
-    b=a[::-1]
-    if b==ce_option_buy_strike_price4:
-        ce4_temp_token=x
-    elif b==pe_option_buy_strike_price4:
-        pe4_temp_token=x
-    elif b==ce_option_buy_strike_price3:
-        ce3_temp_token=x
-    elif b==pe_option_buy_strike_price3:
-        pe3_temp_token=x
-    elif b==ce_option_buy_strike_price2:
-        ce2_temp_token=x
-    elif b==pe_option_buy_strike_price2:
-        pe2_temp_token=x    
-    elif b==ce_option_buy_strike_price1:
-        ce1_temp_token=x
-    elif b==pe_option_buy_strike_price1:
-        pe1_temp_token=x
-    elif b==ce_option_buy_atm_price:
-        ce_atm_temp_token=x
-    elif b==pe_option_buy_atm_price:
-        pe_atm_temp_token=x
-    elif b==pe_option_buy_strike_price_1:
-        pe_1_temp_token=x
-    elif b==ce_option_buy_strike_price_1:
-        ce_1_temp_token=x
-    elif b==pe_option_buy_strike_price_2:
-        pe_2_temp_token=x
-    elif b==ce_option_buy_strike_price_2:
-        ce_2_temp_token=x
-    elif b==pe_option_buy_strike_price_3:
-        pe_3_temp_token=x
-    elif b==ce_option_buy_strike_price_3:
-        ce_3_temp_token=x
-    elif b==pe_option_buy_strike_price_4:
-        pe_4_temp_token=x
-    elif b==ce_option_buy_strike_price_4:
-        ce_4_temp_token=x
-
-
-
-ce4_final_token=d['pSymbol'][ce4_temp_token]
-pe4_final_token=d['pSymbol'][pe4_temp_token]
-ce3_final_token=d['pSymbol'][ce3_temp_token]
-pe3_final_token=d['pSymbol'][pe3_temp_token]
-ce2_final_token=d['pSymbol'][ce2_temp_token]
-pe2_final_token=d['pSymbol'][pe2_temp_token]
-ce1_final_token=d['pSymbol'][ce1_temp_token]
-pe1_final_token=d['pSymbol'][pe1_temp_token]
-ce_atm_final_token=d['pSymbol'][ce_atm_temp_token]  
-pe_atm_final_token=d['pSymbol'][pe_atm_temp_token]
-ce_4_final_token=d['pSymbol'][ce_4_temp_token]
-pe_4_final_token=d['pSymbol'][pe_4_temp_token]
-ce_3_final_token=d['pSymbol'][ce_3_temp_token]
-pe_3_final_token=d['pSymbol'][pe_3_temp_token]
-ce_2_final_token=d['pSymbol'][ce_2_temp_token]
-pe_2_final_token=d['pSymbol'][pe_2_temp_token]
-ce_1_final_token=d['pSymbol'][ce_1_temp_token]
-pe_1_final_token=d['pSymbol'][pe_1_temp_token]  
-
-
-
-
-
-#folder creation
-
-new_folder_path = os.path.join(base_directory, date_for_folder)  
-os.makedirs(new_folder_path)
-
-ce_folder = os.path.join(new_folder_path, 'CE')  
+ce_folder = os.path.join(new_folder_path, 'CE')
 pe_folder = os.path.join(new_folder_path, 'PE')
-os.makedirs(ce_folder)
-os.makedirs(pe_folder)
+os.makedirs(ce_folder, exist_ok=True)
+os.makedirs(pe_folder, exist_ok=True)
 
-per_second_ce= os.path.join(ce_folder, 'Per_Second_Data')
-five_minute_ce= os.path.join(ce_folder, 'Five_Minute_Time_Frame')
-os.makedirs(per_second_ce)
-os.makedirs(five_minute_ce)
+per_second_ce = os.path.join(ce_folder, 'Per_Second_Data')
+five_minute_ce = os.path.join(ce_folder, 'Five_Minute_OHLC')
+os.makedirs(per_second_ce, exist_ok=True)
+os.makedirs(five_minute_ce, exist_ok=True)
 
-per_second_pe= os.path.join(pe_folder, 'Per_Second_Data')
-five_minute_pe= os.path.join(pe_folder, 'Five_Minute_Time_Frame')
-os.makedirs(per_second_pe)
-os.makedirs(five_minute_pe)
+per_second_pe = os.path.join(pe_folder, 'Per_Second_Data')
+five_minute_pe = os.path.join(pe_folder, 'Five_Minute_OHLC')
+os.makedirs(per_second_pe, exist_ok=True)
+os.makedirs(five_minute_pe, exist_ok=True)
 
-
-
-def dump_to_excel(data_list, filename):
-    # Convert data_list to a DataFrame
-    df = pd.DataFrame(data_list)
-    
-    try:
-        # Try to read the existing Excel file if it exists
-        existing_data = pd.read_excel(filename)
-        
-        # Concatenate existing data with new data
-        combined_data = pd.concat([existing_data, df], ignore_index=True)
-        
-        # Write the combined data to the Excel file
-        combined_data.to_excel(filename, index=False)
-    except FileNotFoundError:
-        # If the file doesn't exist, simply write the new data to the file
-        df.to_excel(filename, index=False)
+print(f"Folders created at: {new_folder_path}")
 
 
+# ======================== CSV DUMP FUNCTION ========================
+
+def dump_to_csv(data_list, filename):
+    # writes tick data to a csv file (appends if file exists)
+    if not data_list:
+        return
+    file_exists = os.path.exists(filename) and os.path.getsize(filename) > 0
+    with open(filename, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=['Date', 'Instrument', 'Time', 'LTP'])
+        if not file_exists:
+            writer.writeheader()
+        writer.writerows(data_list)
 
 
+# ======================== PREPARE FOR DATA COLLECTION ========================
+
+# build the instrument token list for the quotes API
+inst2_tokens = []
+for leg in option_chain:
+    inst2_tokens.append({"instrument_token": leg['instrument_token'], "exchange_segment": "nse_fo"})
+
+# create a buffer (list) for each option leg to store ticks temporarily
+tick_buffers = {}
+for leg in option_chain:
+    tick_buffers[leg['instrument_token']] = []
+
+# map each token to its option type so we know which folder to save to
+token_info = {}
+for leg in option_chain:
+    token_info[leg['instrument_token']] = leg['option_type']
 
 
-inst2_tokens = [
-    {"instrument_token": ce_4_final_token, "exchange_segment": "nse_fo"},
-    {"instrument_token": ce_3_final_token, "exchange_segment": "nse_fo"},
-    {"instrument_token": ce_2_final_token, "exchange_segment": "nse_fo"},
-    {"instrument_token": ce_1_final_token, "exchange_segment": "nse_fo"},
-    {"instrument_token": ce_atm_final_token, "exchange_segment": "nse_fo"},
-    {"instrument_token": ce1_final_token, "exchange_segment": "nse_fo"},
-    {"instrument_token": ce2_final_token, "exchange_segment": "nse_fo"},
-    {"instrument_token": ce3_final_token, "exchange_segment": "nse_fo"},
-    {"instrument_token": ce4_final_token, "exchange_segment": "nse_fo"},
-    {"instrument_token": pe4_final_token, "exchange_segment": "nse_fo"},
-    {"instrument_token": pe3_final_token, "exchange_segment": "nse_fo"},
-    {"instrument_token": pe2_final_token, "exchange_segment": "nse_fo"},
-    {"instrument_token": pe1_final_token, "exchange_segment": "nse_fo"},
-    {"instrument_token": pe_atm_final_token, "exchange_segment": "nse_fo"},
-    {"instrument_token": pe_1_final_token, "exchange_segment": "nse_fo"},
-    {"instrument_token": pe_2_final_token, "exchange_segment": "nse_fo"},
-    {"instrument_token": pe_3_final_token, "exchange_segment": "nse_fo"},
-    {"instrument_token": pe_4_final_token, "exchange_segment": "nse_fo"}
-]
-
-
-# Initialize empty lists to store LTP records
-ltp_pe_1 = []
-ltp_pe_2 = []
-ltp_pe_3 = []
-ltp_pe_4 = []
-ltp_pe_atm = []
-ltp_pe_5 = []
-ltp_pe_6 = []
-ltp_pe_7 = []
-ltp_pe_8 = []
-ltp_ce_1 = []
-ltp_ce_2 = []
-ltp_ce_3 = []
-ltp_ce_4 = []
-ltp_ce_atm = []
-ltp_ce_5 = []
-ltp_ce_6 = []
-ltp_ce_7 = []
-ltp_ce_8 = []
-
-inst2_tokens_map = {
-    ce_4_final_token: ltp_ce_1,
-    ce_3_final_token: ltp_ce_2,
-    ce_2_final_token: ltp_ce_3,
-    ce_1_final_token: ltp_ce_4,
-    ce_atm_final_token: ltp_ce_atm,
-    ce1_final_token: ltp_ce_5,
-    ce2_final_token: ltp_ce_6,
-    ce3_final_token: ltp_ce_7,
-    ce4_final_token: ltp_ce_8,
-    pe4_final_token: ltp_pe_1,
-    pe3_final_token: ltp_pe_2,
-    pe2_final_token: ltp_pe_3,
-    pe1_final_token: ltp_pe_4,
-    pe_atm_final_token: ltp_pe_atm,
-    pe_1_final_token: ltp_pe_5,
-    pe_2_final_token: ltp_pe_6,
-    pe_3_final_token: ltp_pe_7,
-    pe_4_final_token: ltp_pe_8
-}
-
+# ======================== MAIN DATA COLLECTION LOOP ========================
 
 print("Starting program till market is open...")
-# Define market open and close times
 market_open = pd.Timestamp('09:14:58')
 market_close = pd.Timestamp('15:29:58')
 
-# Time interval for dumping data (in minutes)
-dump_interval = 3
-quote_data = {'message': [{'trading_symbol': 'temp_placeholder'}]}
-# Collect LTP data every second from 9:14 to 3:30
+# collect LTP data every ~0.5 seconds from 9:15 to 3:30
 while pd.Timestamp.now() <= market_close:
-    # Check if the current time is within the specified range
     if pd.Timestamp.now() >= market_open:
         try:
-            # Fetch LTP data (simulated)
+            # fetch LTP for all our option legs
             quote_data = client.quotes(instrument_tokens=inst2_tokens, quote_type="ltp")
-            
-            # Record the LTP data
+
             current_time = pd.Timestamp.now()
-            date_str = current_time.strftime('%Y-%m-%d')  # Format to show only date
-            time_str = current_time.strftime('%H:%M:%S')  # Format to show only time
-            
+            date_str = current_time.strftime('%Y-%m-%d')
+            time_str = current_time.strftime('%H:%M:%S')
 
-
+            # store each tick in its buffer
             for x in quote_data['message']:
-                instrument_tokenx = x['instrument_token']
-                instrument_namex = x['trading_symbol']
-                ltpx = float(x['ltp'])
-                exchange_segment = x['exchange_segment']
-
-                if instrument_tokenx in inst2_tokens_map:
-                    inst2_tokens_map[instrument_tokenx].append({'Date': date_str, 'Instrument': instrument_namex, 'Time': time_str, 'LTP': ltpx})
+                token = x['instrument_token']
+                if token in tick_buffers:
+                    tick_buffers[token].append({
+                        'Date': date_str,
+                        'Instrument': x['trading_symbol'],
+                        'Time': time_str,
+                        'LTP': float(x['ltp'])
+                    })
                 else:
-                    print("No matching token found for instrument_token:", instrument_tokenx)
-                
-                '''
-                print("\n")
-                print("ltp_pe_1:", ltp_pe_1)
-                print("\n")
-                print("ltp_pe_2:", ltp_pe_2)
-                print("\n")
-                print("ltp_pe_3:", ltp_pe_3)
-                print("\n")
-                print("ltp_pe_4:", ltp_pe_4)
-                print("\n")
-                print("ltp_pe_atm:", ltp_pe_atm)
-                print("\n")
-                print("ltp_pe_5:", ltp_pe_5)
-                print("\n")
-                print("ltp_pe_6:", ltp_pe_6)
-                print("\n")
-                print("ltp_pe_7:", ltp_pe_7)
-                print("\n")
-                print("ltp_pe_8:", ltp_pe_8)
-                print("\n")
-                print("ltp_ce_1:", ltp_ce_1)
-                print("\n")
-                print("ltp_ce_2:", ltp_ce_2)
-                print("\n")
-                print("ltp_ce_3:", ltp_ce_3)
-                print("\n")
-                print("ltp_ce_4:", ltp_ce_4)
-                print("\n")
-                print("ltp_ce_atm:", ltp_ce_atm)
-                print("\n")
-                print("ltp_ce_5:", ltp_ce_5)
-                print("\n")
-                print("ltp_ce_6:", ltp_ce_6)
-                print("\n")
-                print("ltp_ce_7:", ltp_ce_7)
-                print("\n")
-                print("ltp_ce_8:", ltp_ce_8)'''
+                    print("No matching token found for:", token)
 
-
-            # Dump data to Excel files at specified intervals
-            #dump_to_excel(ltp_pe_3, path_folder, excel_file_name)
+            # dump data to csv files at the set interval
             if current_time.minute % dump_interval == 0 and current_time.second == 0 and current_time.minute != 0:
-                for i,x in enumerate(quote_data['message']):
-                    instrument_tokenz= x['instrument_token']
-                    if instrument_tokenz in inst2_tokens_map:
-                        listo=inst2_tokens_map[instrument_tokenz]
-                        namo= x['trading_symbol']
-                        #change the file path here using trading_symbol
-                        dump_to_excel(listo, os.path.join(per_second_ce, namo + '.xlsx'))
-                
+                print("Dumping data to CSV...")
+                for token, ticks in tick_buffers.items():
+                    if not ticks:
+                        continue
+                    symbol = ticks[0]['Instrument']
+                    opt_type = token_info[token]
+                    if opt_type == 'CE':
+                        filepath = os.path.join(per_second_ce, symbol + '.csv')
+                    else:
+                        filepath = os.path.join(per_second_pe, symbol + '.csv')
+                    dump_to_csv(ticks, filepath)
+
                 print("Dumping Done...")
 
-
-                # Clear the lists after dumping data to Excel
+                # clear the buffers for next cycle
                 print("Clearing Temperory lists for next Cycle...")
-                ltp_ce_1.clear() 
-                ltp_ce_2.clear()
-                ltp_ce_3.clear()
-                ltp_ce_4.clear()
-                ltp_ce_atm.clear()
-                ltp_ce_5.clear()
-                ltp_ce_6.clear()
-                ltp_ce_7.clear()
-                ltp_ce_8.clear()
-                ltp_pe_1.clear()
-                ltp_pe_2.clear()
-                ltp_pe_3.clear()
-                ltp_pe_4.clear()
-                ltp_pe_atm.clear()
-                ltp_pe_5.clear()
-                ltp_pe_6.clear()
-                ltp_pe_7.clear()
-                ltp_pe_8.clear()
+                for token in tick_buffers:
+                    tick_buffers[token].clear()
                 print("Cleared Lists.\n\nBeggining next Cycle...")
-            
 
         except Exception as e:
-            print("Error occurred while fetching LTP data:", e)
-    
-    # Wait for 0.5 second before fetching next LTP data
+            print(f"Error occurred while fetching LTP data: {e}")
+
+    # wait before next poll
     sleep(0.5)
-    
-    
-    
-print("Market Closed...")    
-print("Starting conversion of per second data to 5 minutes time frame...")  
-print("Fetching the per second files...")  
 
 
+# ======================== MARKET CLOSED ========================
 
-# List of folder paths
-folder_paths1 = [per_second_pe, per_second_ce]
+print("Market Closed...")
+print("Starting conversion of per second data to 5 minutes time frame...")
 
-# Lists to store file paths and filenames
-file_paths1 = []
-file_names1 = ['']
-
-# Iterate over folders
-for folder_path in folder_paths1:
-    # Walk through the folder
-    for root, dirs, files in os.walk(folder_path):
-        # Iterate over files
-        for file_name in files:
-            # Construct full file path
-            file_pathx = os.path.join(root, file_name)
-            # Append to the list of file paths
-            file_paths1.append(file_pathx)
-            # Extract filename from the full file path and append to the list of filenames
-            file_names1.append(file_name)
-
-# Display the file paths
-print("Files in folders:")
-for x, file_path in enumerate(file_paths1, start=1):
-    print(f"{x}: {file_path}")
-
-# Display the filenames
-print("\nFilenames:")
-for x, file_name in enumerate(file_names1, start=1):
-    print(f"{x}: {file_name}")
+# final dump of any remaining data in buffers
+print("Final dump of remaining data...")
+for token, ticks in tick_buffers.items():
+    if not ticks:
+        continue
+    symbol = ticks[0]['Instrument']
+    opt_type = token_info[token]
+    if opt_type == 'CE':
+        filepath = os.path.join(per_second_ce, symbol + '.csv')
+    else:
+        filepath = os.path.join(per_second_pe, symbol + '.csv')
+    dump_to_csv(ticks, filepath)
+print("Final dump complete")
 
 
+# ======================== CONVERT TO 5 MINUTE OHLC ========================
 
+print("Fetching the per second files...")
 
-excel_file_pe_1 = file_paths1[0]
-excel_file_pe_2 = file_paths1[1]
-excel_file_pe_3 = file_paths1[2]
-excel_file_pe_4 = file_paths1[3]
-excel_file_pe_atm = file_paths1[4]
-excel_file_pe_5 = file_paths1[5]
-excel_file_pe_6 = file_paths1[6]
-excel_file_pe_7 = file_paths1[7]
-excel_file_pe_8 = file_paths1[8]
-
-
-excel_file_ce_1 = file_paths1[9]
-excel_file_ce_2 = file_paths1[10]
-excel_file_ce_3 = file_paths1[11]
-excel_file_ce_4 = file_paths1[12]
-excel_file_ce_atm = file_paths1[13]
-excel_file_ce_5 = file_paths1[14]
-excel_file_ce_6 = file_paths1[15]
-excel_file_ce_7 = file_paths1[16]
-excel_file_ce_8 = file_paths1[17]
-
-df_pe_1 = pd.read_excel(excel_file_pe_1)
-df_pe_2 = pd.read_excel(excel_file_pe_2)
-df_pe_3 = pd.read_excel(excel_file_pe_3)
-df_pe_4 = pd.read_excel(excel_file_pe_4)
-df_pe_atm = pd.read_excel(excel_file_pe_atm)
-df_pe_5 = pd.read_excel(excel_file_pe_5)
-df_pe_6 = pd.read_excel(excel_file_pe_6)
-df_pe_7 = pd.read_excel(excel_file_pe_7)
-df_pe_8 = pd.read_excel(excel_file_pe_8)
-df_ce_1 = pd.read_excel(excel_file_ce_1)
-df_ce_2 = pd.read_excel(excel_file_ce_2)
-df_ce_3 = pd.read_excel(excel_file_ce_3)
-df_ce_4 = pd.read_excel(excel_file_ce_4)
-df_ce_atm = pd.read_excel(excel_file_ce_atm)
-df_ce_5 = pd.read_excel(excel_file_ce_5)
-df_ce_6 = pd.read_excel(excel_file_ce_6)
-df_ce_7 = pd.read_excel(excel_file_ce_7)
-df_ce_8 = pd.read_excel(excel_file_ce_8)
-
-ohlc_pe_1 = None
-
-
-df_lists = [
-    '',df_pe_1, df_pe_2, df_pe_3, df_pe_4, df_pe_atm, df_pe_5, df_pe_6, df_pe_7, df_pe_8,
-    df_ce_1, df_ce_2, df_ce_3, df_ce_4, df_ce_atm, df_ce_5, df_ce_6, df_ce_7, df_ce_8
+# go through both CE and PE per second folders
+folder_pairs = [
+    (per_second_ce, five_minute_ce),
+    (per_second_pe, five_minute_pe)
 ]
 
+for second_folder, ohlc_folder in folder_pairs:
+    if not os.path.exists(second_folder):
+        continue
 
+    for file_name in os.listdir(second_folder):
+        if not file_name.endswith('.csv'):
+            continue
 
-for i, x in enumerate(quote_data['message'], start=1):
-    instrument_namey = x['trading_symbol']
-    # Resample LTP data to 5-minute intervals and calculate OHLC
-    ohlc_pe_1 = df_lists[i].set_index('Time').resample('5T').agg({'LTP': ['first', 'max', 'min', 'last']})
-    ohlc_pe_1.columns = ['Open', 'High', 'Low', 'Close']
+        input_path = os.path.join(second_folder, file_name)
+        output_path = os.path.join(ohlc_folder, file_name)
 
-    # Add instrument name to OHLC data
-    ohlc_pe_1['Instrument'] = instrument_namey 
+        try:
+            df_temp = pd.read_csv(input_path)
+            if df_temp.empty:
+                continue
 
-    # Add time frame column to OHLC data
-    ohlc_pe_1['Time Frame'] = ohlc_pe_1.index.strftime('%H:%M') + '-' + (ohlc_pe_1.index + pd.Timedelta(minutes=4, seconds=59)).strftime('%H:%M')
+            # convert time column and resample to 5 min OHLC
+            df_temp['Time'] = pd.to_datetime(df_temp['Time'], format='%H:%M:%S')
+            df_temp = df_temp.set_index('Time')
 
-    # Save OHLC data to Excel
-    if i <= 9:
-        ohlc_pe_1.to_excel(os.path.join(five_minute_pe, file_names1[i]), index=False)
-    elif 10 <= i <= 18:
-        ohlc_pe_1.to_excel(os.path.join(five_minute_ce, file_names1[i]), index=False)
+            ohlc = df_temp['LTP'].resample('5min').agg({
+                'Open': 'first',
+                'High': 'max',
+                'Low': 'min',
+                'Close': 'last'
+            }).dropna()
 
+            # add instrument name and time frame columns
+            ohlc['Instrument'] = df_temp['Instrument'].iloc[0]
+            ohlc['Time Frame'] = (
+                ohlc.index.strftime('%H:%M') + '-' +
+                (ohlc.index + pd.Timedelta(minutes=4, seconds=59)).strftime('%H:%M')
+            )
 
-    
-    ohlc_pe_1 =None
-    
+            ohlc.to_csv(output_path, index=False)
+            print(f"Converted: {file_name}")
 
+        except Exception as e:
+            print(f"Error converting {file_name}: {e}")
+
+print("Conversion complete!")
+print(f"\nAll done. Data stored at: {new_folder_path}")
