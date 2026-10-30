@@ -1,6 +1,8 @@
-# Kotak Neo — Options Tick Data Collector
+# Storing-Options-Data-using-Kotak-neo-api
 
-Collects **real-time tick data** for NSE index option chains on expiry days using the [Kotak Neo API](https://github.com/Kotak-Neo/kotak-neo-api) and stores it as per-second CSVs plus 5-minute OHLC candles.
+## About
+
+In this python project, we use Kotak Neo Api to fetch live tick data of all NSE Index derivatives(Nifty, Banknifty, Midcapnifty, Finnifty) and store them in CSV format. The choice of using CSV over DBMS was the ease of csv at that time. Looking back, now it makes sense to have used Mysql or some proper database in place of CSV.
 
 ## Supported Indices
 
@@ -13,16 +15,16 @@ Collects **real-time tick data** for NSE index option chains on expiry days usin
 
 ## Prerequisites
 
-- **Kotak Neo account** with API access (provides consumer key & secret)
+- **Kotak Neo account** with API access (consumer key & secret)
 - **Python 3.10+**
 
 ```bash
-pip install neo_api_client pandas python-dateutil nsepython
+pip install neo_api_client pandas python-dateutil nsepython python-dotenv
 ```
 
 ## Configuration
 
-1. Copy [`.env`](.env) and fill in your credentials:
+1. Create a `.env` file and fill in your credentials:
 
 ```env
 KOTAK_CONSUMER_KEY=your_key_here
@@ -33,25 +35,16 @@ KOTAK_LOGIN_MPIN=your_mpin
 BASE_OUTPUT_DIR=C:/Options_Data
 ```
 
-| Variable | Description |
-|---|---|
-| `KOTAK_CONSUMER_KEY` | Your Kotak Neo consumer key |
-| `KOTAK_CONSUMER_SECRET` | Your Kotak Neo consumer secret |
-| `KOTAK_MOBILE_NUMBER` | Registered mobile number (+91 format) |
-| `KOTAK_LOGIN_PASSWORD` | Kotak login password |
-| `KOTAK_LOGIN_MPIN` | Kotak login MPIN |
-| `BASE_OUTPUT_DIR` | Path where data folders are created |
-
 > **⚠️ The `.env` file is gitignored and must never be committed.**
 
 ## How It Works
 
 1. **Login** — Authenticates with Kotak Neo via mobile + MPIN
-2. **Expiry Detection** — Fetches live expiry dates from NSE using `nsepython` to determine which index is expiring today
-3. **ATM Calculation** — Fetches the spot price and rounds to the nearest valid strike
-4. **Option Chain** — Builds the full chain (10 OTM + ATM + 10 ITM for both CE & PE = 42 legs)
-5. **Tick Collection** — Polls LTP every 0.5s during market hours (09:15–15:30), flushing to CSV every 3 minutes
-6. **OHLC Conversion** — After market close, resamples per-second data into 5-minute OHLC candles
+2. **Expiry Detection** — Fetches live expiry dates from NSE using `nsepython` to find which index is expiring today
+3. **ATM Calculation** — Fetches spot price and rounds to nearest valid strike
+4. **Option Chain** — Builds the chain (10 strikes above and below ATM, both CE & PE)
+5. **Tick Collection** — Polls LTP every 0.5s during market hours (09:15–15:30), dumps to CSV every 3 minutes
+6. **OHLC Conversion** — After market close, converts per-second data into 5-minute OHLC candles
 
 ## Output Structure
 
@@ -77,11 +70,9 @@ Options_Data/
 python Kotak.py
 ```
 
-The script runs autonomously — starts before market open, collects data throughout the session, and exits after OHLC conversion.
-
-> **Tip:** For daily unattended runs, use a task scheduler (e.g. cron on Linux, Task Scheduler on Windows) or a dedicated device like a Raspberry Pi.
+Run before market opens. It will collect data throughout the session and convert to OHLC after market close.
 
 ## Credits
 
-- [Kotak Neo API Team](https://github.com/Kotak-Neo/kotak-neo-api) — for API support and guidance
-- [nsepython](https://github.com/unofficed/nsepython) — for reliable NSE data access
+- [Kotak Neo API](https://github.com/Kotak-Neo/kotak-neo-api)
+- [nsepython](https://github.com/unofficed/nsepython)
